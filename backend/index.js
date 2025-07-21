@@ -1,51 +1,63 @@
-const express = require('express');
-const cors = require('cors');
+require('dotenv').config({ path: '../.env' });
+const path = require('path');
 const lti = require('ltijs').Provider;
-const ltiConfig = require('./lti-config');
 
-const app = express();
-const PORT = 3001;
+// Configurar ltijs con los endpoints
+lti.setup(
+  process.env.LTI_TOOL_KEY,
+  { url: process.env.DB_URL || 'memory' }, // Usar memoria si no hay DB
+  {
+    appRoute: '/',                      // Endpoint principal (launch)
+    loginRoute: '/lti/login',           // Endpoint OIDC login initiation
+    keysetRoute: '/.well-known/jwks.json' // JWKS endpoint
+  }
+);
 
-// Middleware
-app.use(cors());
-app.use(express.json());
-
-// Configurar LTI
-const provider = new lti(ltiConfig.tool.key, ltiConfig.tool.secret, {
-  url: ltiConfig.tool.url,
-  name: ltiConfig.tool.name,
-  description: ltiConfig.tool.description,
-  privacyLevel: ltiConfig.tool.privacyLevel
+// Launch handler
+lti.onConnect(async (token, req, res) => {
+  console.log('LTI Launch - Usuario:', token.userInfo.name);
+  console.log('LTI Launch - Rol:', token.userInfo.roles);
+  console.log('LTI Launch - Contexto:', token.contextInfo.contextId);
+  
+  // Redirigir al frontend React con datos del usuario
+  const redirectUrl = `${process.env.FRONTEND_URL}?lti_user=${encodeURIComponent(token.userInfo.name)}&lti_role=${encodeURIComponent(token.userInfo.roles)}&lti_context=${encodeURIComponent(token.contextInfo.contextId)}`;
+  
+  return res.redirect(redirectUrl);
 });
 
-// Middleware LTI
-app.use(provider.app());
+// Registrar plataforma (debe estar después de setup)
+lti.registerPlatform({
+  url: process.env.LTI_PLATFORM_URL,                    // URL de tu Moodle
+  name: process.env.LTI_PLATFORM_NAME,                  // Nombre (ej: Moodle)
+  clientId: process.env.LTI_CLIENT_ID,                  // Client ID de Moodle
+  authenticationEndpoint: `${process.env.LTI_PLATFORM_URL}/mod/lti/auth.php`,
+  accesstokenEndpoint: `${process.env.LTI_PLATFORM_URL}/mod/lti/token.php`,
+  authConfig: {
+    method: 'JWK_SET',
+    key: `${process.env.LTI_TOOL_URL}/.well-known/jwks.json` // JWKS de tu herramienta
+  }
+});
+
+// Middleware para CORS y JSON
+lti.app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  next();
+});
 
 // Ruta de prueba
-app.get('/', (req, res) => {
-  res.json({ message: '¡Backend funcionando correctamente!' });
-});
-
-// Ruta LTI - Página principal de la herramienta
-provider.onConnect(async (token, req, res) => {
-  return res.send(`
-    <html>
-      <head><title>${ltiConfig.tool.name}</title></head>
-      <body>
-        <h1>Bienvenido a ${ltiConfig.tool.name}</h1>
-        <p>Usuario: ${token.userInfo.name}</p>
-        <p>Rol: ${token.userInfo.roles}</p>
-        <script>
-          // Redirigir al frontend React
-          window.location.href = 'http://localhost:5173';
-        </script>
-      </body>
-    </html>
-  `);
+lti.app.get('/api/health', (req, res) => {
+  res.json({ 
+    message: '¡Backend funcionando correctamente!',
+    environment: process.env.NODE_ENV,
+    port: process.env.PORT || 3001,
+    ltiConfigured: true
+  });
 });
 
 // Ruta para obtener datos de ejemplo
-app.get('/api/data', (req, res) => {
+lti.app.get('/api/data', (req, res) => {
   res.json({
     home: {
       title: 'Bienvenido a la página principal',
@@ -87,7 +99,7 @@ app.get('/api/data', (req, res) => {
 });
 
 // Ruta para recibir datos del frontend
-app.post('/api/contact', (req, res) => {
+lti.app.post('/api/contact', (req, res) => {
   const { name, email, message } = req.body;
   
   // Aquí puedes agregar lógica para guardar en base de datos
@@ -100,9 +112,9 @@ app.post('/api/contact', (req, res) => {
 });
 
 // Ruta para obtener información del usuario LTI
-app.get('/api/lti/user', async (req, res) => {
+lti.app.get('/api/lti/user', async (req, res) => {
   try {
-    const token = await provider.validateRequest(req, res);
+    const token = await lti.validateRequest(req, res);
     if (token) {
       res.json({
         user: token.userInfo,
@@ -117,11 +129,36 @@ app.get('/api/lti/user', async (req, res) => {
   }
 });
 
-// Iniciar servidor
-app.listen(PORT, () => {
-  console.log(`🚀 Servidor backend ejecutándose en http://localhost:${PORT}`);
-  console.log(`📡 API disponible en http://localhost:${PORT}/api`);
-  console.log(`🔗 LTI disponible en http://localhost:${PORT}/lti`);
+// Ruta para verificar configuración
+lti.app.get('/api/config', (req, res) => {
+  res.json({
+    port: process.env.PORT || 3001,
+    environment: process.env.NODE_ENV,
+    ltiToolUrl: process.env.LTI_TOOL_URL,
+    frontendUrl: process.env.FRONTEND_URL,
+    platformUrl: process.env.LTI_PLATFORM_URL,
+    platformName: process.env.LTI_PLATFORM_NAME,
+    clientId: process.env.LTI_CLIENT_ID
+  });
 });
 
-module.exports = app; 
+// Deploy el servidor
+const setup = async () => {
+  try {
+    await lti.deploy({ 
+      port: process.env.PORT || 3001,
+      serverless: false
+    });
+    
+    console.log(`🚀 Servidor LTI ejecutándose en http://localhost:${process.env.PORT || 3001}`);
+    console.log(`📡 API disponible en http://localhost:${process.env.PORT || 3001}/api`);
+    console.log(`🔗 LTI Launch: http://localhost:${process.env.PORT || 3001}/`);
+    console.log(`🔐 LTI Login: http://localhost:${process.env.PORT || 3001}/lti/login`);
+    console.log(`🔑 JWKS: http://localhost:${process.env.PORT || 3001}/.well-known/jwks.json`);
+    console.log(`🌍 Entorno: ${process.env.NODE_ENV}`);
+  } catch (error) {
+    console.error('Error al iniciar el servidor:', error);
+  }
+};
+
+setup(); 
